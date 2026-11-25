@@ -49,6 +49,11 @@ export interface BoardRow {
   implied_value_low_usd: number;
   implied_value_high_usd: number;
   implied_value_usd: number;
+  launch_odds_pct: number;
+  farm_verdict: "SET UP" | "MARGINAL" | "SKIP";
+  modeled_net_usd: number;
+  modeled_hours: number;
+  modeled_net_per_hour: number;
   token_status: "pre-token";
   value_drivers: {
     fitted_ratio: number;
@@ -82,16 +87,6 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   universe_size: number;
-  accounting: {
-    ranked: number;
-    tokenized: number;
-    other_pre_token: number;
-    watchlist: number;
-  };
-  feature_evidence: Array<{
-    term: string;
-    coefficient: number;
-  }>;
   calibration: {
     sample_size: number;
     folds: number;
@@ -418,9 +413,53 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
   });
 }
 
+function tokenPrevalence(snapshot: Snapshot): (protocol: SnapshotProtocol) => number {
+  const grouped = new Map<string, { total: number; tokenized: number }>();
+  let total = 0;
+  let tokenized = 0;
+  for (const protocol of snapshot.protocols) {
+    total += 1;
+    const has = hasToken(protocol) ? 1 : 0;
+    tokenized += has;
+    const key = categoryKey(protocol.category);
+    const counts = grouped.get(key) ?? { total: 0, tokenized: 0 };
+    counts.total += 1;
+    counts.tokenized += has;
+    grouped.set(key, counts);
+  }
+  const baseline = tokenized / Math.max(1, total);
+  return (protocol) => {
+    const counts = grouped.get(categoryKey(protocol.category));
+    return counts && counts.total >= 8 ? counts.tokenized / counts.total : baseline;
+  };
+}
+
+function farmEconomics(
+  impliedValue: number,
+  odds: number,
+  protocol: SnapshotProtocol,
+  age: number | null,
+): Pick<BoardRow, "farm_verdict" | "modeled_net_usd" | "modeled_hours" | "modeled_net_per_hour"> {
+  const capital = capitalBand(protocol.tvl_usd);
+  const hold = age === null ? 45 : age < 180 ? 60 : age < 730 ? 45 : 30;
+  const hours = 0.25 + (hold / 7) * (10 / 60) + 0.5;
+  const participationValue = impliedValue * 0.000002 * odds;
+  const gas = 3 + (capital >= 150 ? 8 : 4) + (hold / 7) * 2 + 3;
+  const capitalCost = capital * 0.05 * (hold / 365);
+  const net = participationValue - gas - capitalCost;
+  const perHour = net / hours;
+  return {
+    farm_verdict: perHour >= 8 ? "SET UP" : perHour >= 0 ? "MARGINAL" : "SKIP",
+    modeled_net_usd: round(net, 2),
+    modeled_hours: round(hours, 1),
+    modeled_net_per_hour: round(perHour, 2),
+  };
+}
+
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const benchmarks = buildBenchmarks(snapshot);
+  const prevalence = tokenPrevalence(snapshot);
   const selected = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
     const protocol = index.get(slug);
@@ -432,10 +471,19 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     .slice(0, MODEL.earlyRows);
   for (const protocol of early) selected.set(protocol.slug, protocol);
 
-  const scored = [...selected.values()].map((protocol) => ({
-    protocol,
-    ...weightedValue(protocol, snapshot.as_of, benchmarks),
-  }));
+  const scored = [...selected.values()].map((protocol) => {
+    const weighted = weightedValue(protocol, snapshot.as_of, benchmarks);
+    const rawOdds = prevalence(protocol);
+    const growth = Math.min(110, Math.max(-50, protocol.change_7d ?? 0));
+    const ageFactor = weighted.age === null ? 0.92 : 0.85 + Math.min(1460, weighted.age) / 1460 * 0.15;
+    const odds = Math.min(0.95, Math.max(0.05, rawOdds * (1 + (growth / 100) * 0.25) * ageFactor));
+    return {
+      protocol,
+      ...weighted,
+      odds,
+      economics: farmEconomics(weighted.value, odds, protocol, weighted.age),
+    };
+  });
   scored.sort((a, b) => b.value - a.value || a.protocol.slug.localeCompare(b.protocol.slug));
   const board = scored.map((row, index): BoardRow => ({
     rank: index + 1,
@@ -449,6 +497,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     implied_value_low_usd: row.low,
     implied_value_high_usd: row.high,
     implied_value_usd: row.value,
+    launch_odds_pct: round(row.odds * 100, 1),
+    ...row.economics,
     token_status: "pre-token",
     value_drivers: row.factors,
     farm_steps: farmSteps(row.protocol, row.age),
@@ -478,23 +528,6 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     early_size: board.filter((row) => !snapshot.watchlist.includes(row.slug)).length,
     live_size: live.length,
     universe_size: snapshot.protocols.length,
-    accounting: {
-      ranked: board.length,
-      tokenized: snapshot.protocols.filter((protocol) => hasToken(protocol)).length,
-      other_pre_token: Math.max(
-        0,
-        snapshot.protocols.length -
-          board.length -
-          snapshot.protocols.filter((protocol) => hasToken(protocol)).length,
-      ),
-      watchlist: snapshot.watchlist.length,
-    },
-    feature_evidence: [
-      { term: "log10(TVL)", coefficient: benchmarks.coefficients[1] ?? 0 },
-      { term: "7-day growth", coefficient: benchmarks.coefficients[2] ?? 0 },
-      { term: "age (0-4y)", coefficient: benchmarks.coefficients[3] ?? 0 },
-      { term: "log2(chains)", coefficient: benchmarks.coefficients[4] ?? 0 },
-    ],
     calibration: benchmarks.calibration,
     rows: board.map(({ farm_steps: _steps, ...row }) => row),
     live,

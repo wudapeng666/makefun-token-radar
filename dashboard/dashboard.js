@@ -124,10 +124,13 @@
         node("div", { class: "metric" }, node("span", { text: "Without token" }), node("b", { text: age(row.age_days) })),
         node("div", { class: "metric" }, node("span", { text: "Fitted FDV/TVL" }), node("b", { text: "×" + row.value_drivers.fitted_ratio })),
         node("div", { class: "metric" }, node("span", { text: "7d sensitivity" }), node("b", { text: row.value_drivers.growth_coefficient })),
-        node("div", { class: "metric" }, node("span", { text: "Implied value" }), node("b", { text: money(row.implied_value_usd) }))
+        node("div", { class: "metric" }, node("span", { text: "Implied value" }), node("b", { text: money(row.implied_value_usd) })),
+        node("div", { class: "metric" }, node("span", { text: "Launch odds" }), node("b", { text: row.launch_odds_pct + "%" })),
+        node("div", { class: "metric" }, node("span", { text: "Modeled net" }), node("b", { text: money(row.modeled_net_usd) })),
+        node("div", { class: "metric" }, node("span", { text: "Net / hour" }), node("b", { text: "$" + Number(row.modeled_net_per_hour).toFixed(2) }))
       )
     ));
-    body.appendChild(node("p", { class: "subtle", text: "Peer range: " + money(row.implied_value_low_usd) + " to " + money(row.implied_value_high_usd) + ". The range uses the category peers' lower and upper quartile FDV/TVL, not a promise." }));
+    body.appendChild(node("p", { class: "subtle", text: "Verdict: " + row.farm_verdict + ". Peer range: " + money(row.implied_value_low_usd) + " to " + money(row.implied_value_high_usd) + ". Modeled net uses a 0.0002% modeled allocation, assumed gas, " + row.modeled_hours + " work hours and a 5% annual capital cost; it is not a promise." }));
     body.appendChild(node("section", { class: "detail-section" },
       node("h3", { text: "Farm plan" }),
       node("ol", { class: "steps" }, steps(row).map(function (step) { return node("li", { text: step }); }))
@@ -155,7 +158,7 @@
     return node("section", { class: "summary" },
       node("div", null,
         node("p", { class: "note", text: "A fitted launch-value radar using TVL, seven-day growth, protocol age and chain breadth, with a category-peer uncertainty band. It does not predict whether a token will launch." }),
-        node("p", { class: "subtle", text: "5-fold holdout: " + DATA.calibration.sample_size + " live protocols, median error " + DATA.calibration.median_error_pct + "%, " + DATA.calibration.within_two_x_pct + "% within 2×. Verify contracts and audits before using capital." })
+        node("p", { class: "subtle", text: "5-fold holdout: " + DATA.calibration.sample_size + " live protocols, median error " + DATA.calibration.median_error_pct + "%, " + DATA.calibration.within_two_x_pct + "% within 2×. Odds use category token prevalence; farm verdicts include modeled gas and time." })
       ),
       node("div", null, node("p", { text: "Snapshot screened" }), node("strong", { text: String(DATA.universe_size) })),
       node("div", null, node("p", { text: "Watchlist covered" }), node("strong", { text: DATA.watchlist_size + " / " + DATA.watchlist_size })),
@@ -183,46 +186,6 @@
     );
   }
 
-  function evidence() {
-    var a = DATA.accounting;
-    var rankedShare = Math.round((a.ranked / DATA.universe_size) * 100);
-    var tokenizedShare = Math.round((a.tokenized / DATA.universe_size) * 100);
-    var otherShare = Math.max(0, 100 - rankedShare - tokenizedShare);
-    return node("section", { class: "evidence" },
-      node("div", { class: "evidence-panel" },
-        node("div", { class: "evidence-title" },
-          node("span", { text: "Protocol accounting" }),
-          node("span", { text: DATA.universe_size + " total" })
-        ),
-        node("div", { class: "ledger" },
-          node("span", { class: "ranked", style: "width:" + rankedShare + "%", text: String(a.ranked) }),
-          node("span", { class: "tokenized", style: "width:" + tokenizedShare + "%", text: String(a.tokenized) }),
-          node("span", { class: "other", style: "width:" + otherShare + "%", text: String(a.other_pre_token) })
-        ),
-        node("div", { class: "ledger-copy" },
-          node("span", { text: "■ Ranked pre-token " + a.ranked }),
-          node("span", { text: "■ Tokenized or excluded " + a.tokenized }),
-          node("span", { text: "■ Other pre-token " + a.other_pre_token }),
-          node("span", { text: "watchlist " + a.watchlist + " / " + a.watchlist })
-        ),
-        node("p", { class: "evidence-copy", text: "The sealed snapshot contains " + DATA.universe_size + " protocols. Every watchlist slug is ranked; the early radar adds pre-token protocols below the floor." })
-      ),
-      node("div", { class: "evidence-panel" },
-        node("div", { class: "evidence-title" },
-          node("span", { text: "5-fold holdout evidence" }),
-          node("span", { text: DATA.calibration.sample_size + " tokenized protocols" })
-        ),
-        node("div", { class: "coefficients" }, DATA.feature_evidence.map(function (item) {
-          return node("div", { class: "coefficient" },
-            node("span", { text: item.term }),
-            node("b", { text: (item.coefficient >= 0 ? "+" : "") + Number(item.coefficient).toFixed(4) })
-          );
-        })),
-        node("p", { class: "evidence-copy", text: "Median held-out error " + DATA.calibration.median_error_pct + "%; " + DATA.calibration.within_two_x_pct + "% within 2×. No protocol name enters the fit; the uncertainty band is the category peers' interquartile ratio." })
-      )
-    );
-  }
-
   function sortButton(key, label) {
     return node("th", null, node("button", { type: "button", text: label + (state.sort === key ? (state.direction < 0 ? " ↓" : " ↑") : ""), onclick: function () {
       if (state.sort === key) state.direction *= -1;
@@ -243,7 +206,7 @@
       node("div", { class: "table-wrap" },
         node("table", null,
           node("thead", null, node("tr", null,
-            node("th", { text: "Rank" }), sortButton("name", "Protocol"), sortButton("tvl", "TVL"), sortButton("growth", "7d"), sortButton("age", "Age"), sortButton("value", "Implied value"), node("th", { text: "Model state" })
+            node("th", { text: "Rank" }), sortButton("name", "Protocol"), sortButton("tvl", "TVL"), sortButton("growth", "7d"), sortButton("age", "Age"), node("th", { text: "Launch odds" }), sortButton("value", "Implied value"), node("th", { text: "Farm / $h" })
           )),
           node("tbody", null, list.map(function (row) {
             var growthClass = row.change_7d === null ? "" : row.change_7d >= 0 ? "positive" : "negative";
@@ -253,8 +216,12 @@
               node("td", { class: "num", text: money(row.tvl_usd) }),
               node("td", { class: "num " + growthClass, text: pct(row.change_7d) }),
               node("td", { class: "num", text: age(row.age_days) }),
+              node("td", { class: "odds" }, node("div", { class: "bar" }, node("i", { style: "width:" + Math.max(3, row.launch_odds_pct) + "%" })), node("span", { class: "num", text: row.launch_odds_pct + "%" })),
               node("td", { class: "value" }, node("div", { class: "bar" }, node("i", { style: "width:" + Math.max(3, Math.round((row.implied_value_usd / maximum) * 100)) + "%" })), node("span", { class: "num", text: money(row.implied_value_usd) })),
-              node("td", null, node("span", { class: "status", text: "ranked" }))
+              node("td", null,
+                node("span", { class: "verdict " + row.farm_verdict.toLowerCase().replace(" ", "-"), text: row.farm_verdict }),
+                node("div", { class: "verdict-copy", text: "$" + Number(row.modeled_net_per_hour).toFixed(2) + "/h" })
+              )
             );
           }))
         )
@@ -300,7 +267,6 @@
     var shell = node("div", { class: "shell" });
     shell.appendChild(header());
     shell.appendChild(summary());
-    shell.appendChild(evidence());
     shell.appendChild(toolbar());
     shell.appendChild(state.tab === "pre-token" ? preTokenTable() : liveTable());
     shell.appendChild(methodology());
