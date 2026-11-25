@@ -183,6 +183,46 @@
     );
   }
 
+  function evidence() {
+    var a = DATA.accounting;
+    var rankedShare = Math.round((a.ranked / DATA.universe_size) * 100);
+    var tokenizedShare = Math.round((a.tokenized / DATA.universe_size) * 100);
+    var otherShare = Math.max(0, 100 - rankedShare - tokenizedShare);
+    return node("section", { class: "evidence" },
+      node("div", { class: "evidence-panel" },
+        node("div", { class: "evidence-title" },
+          node("span", { text: "Protocol accounting" }),
+          node("span", { text: DATA.universe_size + " total" })
+        ),
+        node("div", { class: "ledger" },
+          node("span", { class: "ranked", style: "width:" + rankedShare + "%", text: String(a.ranked) }),
+          node("span", { class: "tokenized", style: "width:" + tokenizedShare + "%", text: String(a.tokenized) }),
+          node("span", { class: "other", style: "width:" + otherShare + "%", text: String(a.other_pre_token) })
+        ),
+        node("div", { class: "ledger-copy" },
+          node("span", { text: "■ Ranked pre-token " + a.ranked }),
+          node("span", { text: "■ Tokenized or excluded " + a.tokenized }),
+          node("span", { text: "■ Other pre-token " + a.other_pre_token }),
+          node("span", { text: "watchlist " + a.watchlist + " / " + a.watchlist })
+        ),
+        node("p", { class: "evidence-copy", text: "The sealed snapshot contains " + DATA.universe_size + " protocols. Every watchlist slug is ranked; the early radar adds pre-token protocols below the floor." })
+      ),
+      node("div", { class: "evidence-panel" },
+        node("div", { class: "evidence-title" },
+          node("span", { text: "5-fold holdout evidence" }),
+          node("span", { text: DATA.calibration.sample_size + " tokenized protocols" })
+        ),
+        node("div", { class: "coefficients" }, DATA.feature_evidence.map(function (item) {
+          return node("div", { class: "coefficient" },
+            node("span", { text: item.term }),
+            node("b", { text: (item.coefficient >= 0 ? "+" : "") + Number(item.coefficient).toFixed(4) })
+          );
+        })),
+        node("p", { class: "evidence-copy", text: "Median held-out error " + DATA.calibration.median_error_pct + "%; " + DATA.calibration.within_two_x_pct + "% within 2×. No protocol name enters the fit; the uncertainty band is the category peers' interquartile ratio." })
+      )
+    );
+  }
+
   function sortButton(key, label) {
     return node("th", null, node("button", { type: "button", text: label + (state.sort === key ? (state.direction < 0 ? " ↓" : " ↑") : ""), onclick: function () {
       if (state.sort === key) state.direction *= -1;
@@ -260,6 +300,7 @@
     var shell = node("div", { class: "shell" });
     shell.appendChild(header());
     shell.appendChild(summary());
+    shell.appendChild(evidence());
     shell.appendChild(toolbar());
     shell.appendChild(state.tab === "pre-token" ? preTokenTable() : liveTable());
     shell.appendChild(methodology());

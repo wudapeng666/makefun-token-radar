@@ -82,6 +82,16 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   universe_size: number;
+  accounting: {
+    ranked: number;
+    tokenized: number;
+    other_pre_token: number;
+    watchlist: number;
+  };
+  feature_evidence: Array<{
+    term: string;
+    coefficient: number;
+  }>;
   calibration: {
     sample_size: number;
     folds: number;
@@ -468,6 +478,23 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     early_size: board.filter((row) => !snapshot.watchlist.includes(row.slug)).length,
     live_size: live.length,
     universe_size: snapshot.protocols.length,
+    accounting: {
+      ranked: board.length,
+      tokenized: snapshot.protocols.filter((protocol) => hasToken(protocol)).length,
+      other_pre_token: Math.max(
+        0,
+        snapshot.protocols.length -
+          board.length -
+          snapshot.protocols.filter((protocol) => hasToken(protocol)).length,
+      ),
+      watchlist: snapshot.watchlist.length,
+    },
+    feature_evidence: [
+      { term: "log10(TVL)", coefficient: benchmarks.coefficients[1] ?? 0 },
+      { term: "7-day growth", coefficient: benchmarks.coefficients[2] ?? 0 },
+      { term: "age (0-4y)", coefficient: benchmarks.coefficients[3] ?? 0 },
+      { term: "log2(chains)", coefficient: benchmarks.coefficients[4] ?? 0 },
+    ],
     calibration: benchmarks.calibration,
     rows: board.map(({ farm_steps: _steps, ...row }) => row),
     live,
