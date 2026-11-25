@@ -58,7 +58,7 @@ h1 {
 }
 .summary {
   display: grid;
-  grid-template-columns: 1.35fr repeat(3, .65fr);
+  grid-template-columns: 1.35fr repeat(4, .65fr);
   gap: 1px;
   margin: 22px 0;
   background: var(--line);

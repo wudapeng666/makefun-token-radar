@@ -122,11 +122,12 @@
         node("div", { class: "metric" }, node("span", { text: "TVL" }), node("b", { text: money(row.tvl_usd) })),
         node("div", { class: "metric" }, node("span", { text: "7-day TVL" }), node("b", { text: pct(row.change_7d) })),
         node("div", { class: "metric" }, node("span", { text: "Without token" }), node("b", { text: age(row.age_days) })),
-        node("div", { class: "metric" }, node("span", { text: "Category factor" }), node("b", { text: "×" + row.value_drivers.category_multiple })),
-        node("div", { class: "metric" }, node("span", { text: "Growth factor" }), node("b", { text: "×" + row.value_drivers.growth_multiplier })),
+        node("div", { class: "metric" }, node("span", { text: "Fitted FDV/TVL" }), node("b", { text: "×" + row.value_drivers.fitted_ratio })),
+        node("div", { class: "metric" }, node("span", { text: "7d sensitivity" }), node("b", { text: row.value_drivers.growth_coefficient })),
         node("div", { class: "metric" }, node("span", { text: "Implied value" }), node("b", { text: money(row.implied_value_usd) }))
       )
     ));
+    body.appendChild(node("p", { class: "subtle", text: "Peer range: " + money(row.implied_value_low_usd) + " to " + money(row.implied_value_high_usd) + ". The range uses the category peers' lower and upper quartile FDV/TVL, not a promise." }));
     body.appendChild(node("section", { class: "detail-section" },
       node("h3", { text: "Farm plan" }),
       node("ol", { class: "steps" }, steps(row).map(function (step) { return node("li", { text: step }); }))
@@ -153,9 +154,10 @@
   function summary() {
     return node("section", { class: "summary" },
       node("div", null,
-        node("p", { class: "note", text: "A ranked launch watchlist built only from TVL, growth, age, category economics and chain breadth. It does not predict whether a token will launch." }),
-        node("p", { class: "subtle", text: "Implied value is a model. Verify contracts, audits and eligibility before using capital." })
+        node("p", { class: "note", text: "A fitted launch-value radar using TVL, seven-day growth, protocol age and chain breadth, with a category-peer uncertainty band. It does not predict whether a token will launch." }),
+        node("p", { class: "subtle", text: "5-fold holdout: " + DATA.calibration.sample_size + " live protocols, median error " + DATA.calibration.median_error_pct + "%, " + DATA.calibration.within_two_x_pct + "% within 2×. Verify contracts and audits before using capital." })
       ),
+      node("div", null, node("p", { text: "Snapshot screened" }), node("strong", { text: String(DATA.universe_size) })),
       node("div", null, node("p", { text: "Watchlist covered" }), node("strong", { text: DATA.watchlist_size + " / " + DATA.watchlist_size })),
       node("div", null, node("p", { text: "Pre-token rows" }), node("strong", { text: String(DATA.board_size) })),
       node("div", null, node("p", { text: "Below-floor discoveries" }), node("strong", { text: String(DATA.early_size) }))
@@ -249,7 +251,7 @@
         node("h2", { text: "Value is a weighted function, not a name list." }),
         node("p", { text: "A protocol below the house floor can still enter the early radar. The watchlist is always included, and live-token protocols are excluded from the ranking." })
       ),
-      node("div", { class: "formula", text: "implied = TVL × 0.18 × categoryMultiple × growthMultiplier × maturityMultiplier × chainBreadthMultiplier\ncategory = category economics only\ngrowth = clamp(7d TVL change, -50%, +110%) × 0.38\nmaturity = 55% + age / 1,460d × 45%\nearly radar = top 160 pre-token protocols below the floor by TVL" })
+      node("div", { class: "formula", text: "log10(marketCap) = intercept + β1·log10(TVL) + β2·clamp(7d growth) + β3·age + β4·log2(chains)\nfit = ridge least squares on live-token protocols in the sealed snapshot\nvalidation = 5-fold holdout, not fitted on the test fold\nimplied = TVL × the fitted market-cap / TVL ratio\nrange = category peers' 25th-75th percentile ratio around the fitted value\nsample = " + DATA.calibration.sample_size + " live protocols; folds = " + DATA.calibration.folds + "\nearly radar = top 160 pre-token protocols below the floor by TVL" })
     );
   }
 

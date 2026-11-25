@@ -21,26 +21,18 @@ export interface Snapshot {
 
 export interface ModelConfig {
   version: string;
-  baseMultiple: number;
-  growthWeight: number;
-  growthFloor: number;
-  growthCap: number;
-  maturityFloor: number;
-  maturityDays: number;
-  unknownAgeDays: number;
+  fallbackRatio: number;
+  ratioMinimum: number;
+  ratioMaximum: number;
   earlyRows: number;
   liveRows: number;
 }
 
 export const MODEL: ModelConfig = {
-  version: "launch-compass-v2",
-  baseMultiple: 0.18,
-  growthWeight: 0.38,
-  growthFloor: -50,
-  growthCap: 110,
-  maturityFloor: 0.55,
-  maturityDays: 1460,
-  unknownAgeDays: 540,
+  version: "peer-fitted-v4",
+  fallbackRatio: 0.16,
+  ratioMinimum: 0.015,
+  ratioMaximum: 2.5,
   earlyRows: 160,
   liveRows: 30,
 };
@@ -54,13 +46,18 @@ export interface BoardRow {
   tvl_usd: number;
   change_7d: number | null;
   age_days: number | null;
+  implied_value_low_usd: number;
+  implied_value_high_usd: number;
   implied_value_usd: number;
   token_status: "pre-token";
   value_drivers: {
-    category_multiple: number;
-    growth_multiplier: number;
-    maturity_multiplier: number;
-    breadth_multiplier: number;
+    fitted_ratio: number;
+    fitted_ratio_low: number;
+    fitted_ratio_high: number;
+    training_sample: number;
+    growth_coefficient: number;
+    age_coefficient: number;
+    chain_coefficient: number;
   };
   farm_steps: string[];
 }
@@ -84,8 +81,22 @@ export interface RadarData {
   board_size: number;
   early_size: number;
   live_size: number;
+  universe_size: number;
+  calibration: {
+    sample_size: number;
+    folds: number;
+    median_error_pct: number;
+    within_two_x_pct: number;
+  };
   rows: Omit<BoardRow, "farm_steps">[];
   live: LiveRow[];
+}
+
+interface PeerBenchmark {
+  median: number;
+  low: number;
+  high: number;
+  count: number;
 }
 
 const DAY_MS = 86_400_000;
@@ -162,37 +173,190 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((end - start) / DAY_MS));
 }
 
-/** Category economics, not protocol names, set the launch-value multiple. */
-export function categoryMultiple(category: string | null): number {
-  const c = (category ?? "other").toLowerCase();
-  if (/(rwa|real world)/.test(c)) return 0.24;
-  if (/(derivative|perpetual|options)/.test(c)) return 0.21;
-  if (/(lending|cdp|collateral)/.test(c)) return 0.17;
-  if (/(dex|exchange)/.test(c)) return 0.16;
-  if (/(yield|leveraged farm)/.test(c)) return 0.15;
-  if (/(liquid staking|restaking)/.test(c)) return 0.13;
-  if (/(stable|synthetics)/.test(c)) return 0.12;
-  if (/(bridge|canonical bridge)/.test(c)) return 0.1;
-  return 0.14;
+function quantile(values: number[], fraction: number): number {
+  if (values.length === 0) return MODEL.fallbackRatio;
+  const ordered = values.slice().sort((a, b) => a - b);
+  const position = (ordered.length - 1) * fraction;
+  const low = Math.floor(position);
+  const high = Math.ceil(position);
+  if (low === high) return ordered[low]!;
+  return ordered[low]! * (high - position) + ordered[high]! * (position - low);
 }
 
-export function weightedValue(p: SnapshotProtocol, asOf: string): { value: number; factors: BoardRow["value_drivers"]; age: number | null } {
+function benchmark(values: number[]): PeerBenchmark {
+  const usable = values.filter((value) => Number.isFinite(value) && value > 0);
+  if (usable.length === 0) {
+    return { median: MODEL.fallbackRatio, low: MODEL.fallbackRatio, high: MODEL.fallbackRatio, count: 0 };
+  }
+  return {
+    median: quantile(usable, 0.5),
+    low: quantile(usable, 0.25),
+    high: quantile(usable, 0.75),
+    count: usable.length,
+  };
+}
+
+interface Benchmarks {
+  byCategory: Map<string, PeerBenchmark>;
+  overall: PeerBenchmark;
+  coefficients: number[];
+  calibration: RadarData["calibration"];
+}
+
+function ratioFor(p: SnapshotProtocol): number | null {
+  if (!hasToken(p) || p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) return null;
+  const ratio = p.mcap_usd / p.tvl_usd;
+  return ratio >= 0.015 && ratio <= 2.5 ? ratio : null;
+}
+
+function categoryKey(category: string | null): string {
+  return (category ?? "other").toLowerCase();
+}
+
+function buildBenchmarks(snapshot: Snapshot): Benchmarks {
+  const grouped = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const protocol of snapshot.protocols) {
+    const ratio = ratioFor(protocol);
+    if (ratio === null) continue;
+    all.push(ratio);
+    const key = categoryKey(protocol.category);
+    const values = grouped.get(key) ?? [];
+    values.push(ratio);
+    grouped.set(key, values);
+  }
+  const byCategory = new Map<string, PeerBenchmark>();
+  for (const [key, values] of grouped) {
+    if (values.length >= 4) byCategory.set(key, benchmark(values));
+  }
+  const overall = benchmark(all);
+  const training = snapshot.protocols.filter((p) => ratioFor(p) !== null);
+  const coefficients = fitCoefficients(training, snapshot.as_of);
+  return {
+    byCategory,
+    overall,
+    coefficients,
+    calibration: crossValidate(training, snapshot.as_of),
+  };
+}
+
+function peerBenchmark(p: SnapshotProtocol, benchmarks: Benchmarks): PeerBenchmark {
+  return benchmarks.byCategory.get(categoryKey(p.category)) ?? benchmarks.overall;
+}
+
+function featureVector(p: SnapshotProtocol, asOf: string): number[] {
+  const days = ageDays(asOf, p.listed_at) ?? 540;
+  return [
+    1,
+    Math.log10(Math.max(1, p.tvl_usd)),
+    Math.min(110, Math.max(-50, p.change_7d ?? 0)) / 100,
+    Math.min(1460, Math.max(0, days)) / 1460,
+    Math.log2(Math.max(1, p.chains.length)),
+  ];
+}
+
+function solve(matrix: number[][], vector: number[]): number[] {
+  const n = vector.length;
+  const a = matrix.map((row, index) => [...row, vector[index]!]);
+  for (let column = 0; column < n; column++) {
+    let pivot = column;
+    for (let row = column + 1; row < n; row++) {
+      if (Math.abs(a[row]![column]!) > Math.abs(a[pivot]![column]!)) pivot = row;
+    }
+    [a[column], a[pivot]] = [a[pivot]!, a[column]!];
+    const divisor = a[column]![column]! || 1e-12;
+    for (let j = column; j <= n; j++) a[column]![j] = a[column]![j]! / divisor;
+    for (let row = 0; row < n; row++) {
+      if (row === column) continue;
+      const factor = a[row]![column]!;
+      for (let j = column; j <= n; j++) a[row]![j] = a[row]![j]! - factor * a[column]![j]!;
+    }
+  }
+  return a.map((row) => row[n]!);
+}
+
+function fitCoefficients(rows: SnapshotProtocol[], asOf: string): number[] {
+  const size = 5;
+  const xtx = Array.from({ length: size }, () => Array<number>(size).fill(0));
+  const xty = Array<number>(size).fill(0);
+  for (const row of rows) {
+    const x = featureVector(row, asOf);
+    const y = Math.log10(Math.max(1, row.mcap_usd ?? 1));
+    for (let i = 0; i < size; i++) {
+      xty[i] += x[i]! * y;
+      for (let j = 0; j < size; j++) xtx[i]![j] += x[i]! * x[j]!;
+    }
+  }
+  const ridge = [0, 0.02, 0.2, 0.2, 0.2];
+  for (let i = 0; i < size; i++) xtx[i]![i] += ridge[i]!;
+  return solve(xtx, xty);
+}
+
+function predictedMarketCap(p: SnapshotProtocol, asOf: string, coefficients: number[]): number {
+  const x = featureVector(p, asOf);
+  const logValue = x.reduce((sum, value, index) => sum + value * coefficients[index]!, 0);
+  return 10 ** logValue;
+}
+
+function crossValidate(rows: SnapshotProtocol[], asOf: string): RadarData["calibration"] {
+  const errors: number[] = [];
+  let withinTwo = 0;
+  const folds = 5;
+  for (let fold = 0; fold < folds; fold++) {
+    const train = rows.filter((_, index) => index % folds !== fold);
+    const test = rows.filter((_, index) => index % folds === fold);
+    const coefficients = fitCoefficients(train, asOf);
+    for (const row of test) {
+      const predicted = predictedMarketCap(row, asOf, coefficients);
+      const actual = row.mcap_usd ?? predicted;
+      errors.push(Math.abs(predicted - actual) / Math.max(1, actual));
+      if (predicted >= actual / 2 && predicted <= actual * 2) withinTwo += 1;
+    }
+  }
+  return {
+    sample_size: rows.length,
+    folds,
+    median_error_pct: errors.length ? round(quantile(errors, 0.5) * 100, 1) : 0,
+    within_two_x_pct: errors.length ? round((withinTwo / errors.length) * 100, 1) : 0,
+  };
+}
+
+function weightedValue(
+  p: SnapshotProtocol,
+  asOf: string,
+  benchmarks: Benchmarks,
+): {
+  value: number;
+  low: number;
+  high: number;
+  factors: BoardRow["value_drivers"];
+  age: number | null;
+} {
   const age = ageDays(asOf, p.listed_at);
-  const eAge = age ?? MODEL.unknownAgeDays;
-  const growth = Math.min(MODEL.growthCap, Math.max(MODEL.growthFloor, p.change_7d ?? 0));
-  const growthMultiplier = Math.max(0.35, 1 + (growth / 100) * MODEL.growthWeight);
-  const maturityMultiplier = MODEL.maturityFloor + (Math.min(Math.max(eAge, 0), MODEL.maturityDays) / MODEL.maturityDays) * (1 - MODEL.maturityFloor);
-  const breadthMultiplier = 1 + Math.min(0.12, Math.log2(Math.max(1, p.chains.length)) * 0.025);
-  const categoryMultiplier = categoryMultiple(p.category);
-  const value = Math.max(1, Math.round(p.tvl_usd * MODEL.baseMultiple * categoryMultiplier * growthMultiplier * maturityMultiplier * breadthMultiplier));
+  const fittedRatio = Math.min(
+    MODEL.ratioMaximum,
+    Math.max(
+      MODEL.ratioMinimum,
+      predictedMarketCap(p, asOf, benchmarks.coefficients) / Math.max(1, p.tvl_usd),
+    ),
+  );
+  const peers = peerBenchmark(p, benchmarks);
+  const lowRatio = fittedRatio * (peers.low / Math.max(peers.median, 1e-9));
+  const highRatio = fittedRatio * (peers.high / Math.max(peers.median, 1e-9));
+  const value = Math.max(1, Math.round(p.tvl_usd * fittedRatio));
   return {
     value,
+    low: Math.max(1, Math.round(p.tvl_usd * lowRatio)),
+    high: Math.max(1, Math.round(p.tvl_usd * highRatio)),
     age,
     factors: {
-      category_multiple: round(categoryMultiplier, 4),
-      growth_multiplier: round(growthMultiplier, 4),
-      maturity_multiplier: round(maturityMultiplier, 4),
-      breadth_multiplier: round(breadthMultiplier, 4),
+      fitted_ratio: round(fittedRatio, 4),
+      fitted_ratio_low: round(lowRatio, 4),
+      fitted_ratio_high: round(highRatio, 4),
+      training_sample: benchmarks.calibration.sample_size,
+      growth_coefficient: round(benchmarks.coefficients[2] ?? 0, 4),
+      age_coefficient: round(benchmarks.coefficients[3] ?? 0, 4),
+      chain_coefficient: round(benchmarks.coefficients[4] ?? 0, 4),
     },
   };
 }
@@ -246,6 +410,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): string[] {
 
 export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: RadarData } {
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
+  const benchmarks = buildBenchmarks(snapshot);
   const selected = new Map<string, SnapshotProtocol>();
   for (const slug of snapshot.watchlist) {
     const protocol = index.get(slug);
@@ -257,7 +422,10 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     .slice(0, MODEL.earlyRows);
   for (const protocol of early) selected.set(protocol.slug, protocol);
 
-  const scored = [...selected.values()].map((protocol) => ({ protocol, ...weightedValue(protocol, snapshot.as_of) }));
+  const scored = [...selected.values()].map((protocol) => ({
+    protocol,
+    ...weightedValue(protocol, snapshot.as_of, benchmarks),
+  }));
   scored.sort((a, b) => b.value - a.value || a.protocol.slug.localeCompare(b.protocol.slug));
   const board = scored.map((row, index): BoardRow => ({
     rank: index + 1,
@@ -268,6 +436,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     tvl_usd: row.protocol.tvl_usd,
     change_7d: row.protocol.change_7d,
     age_days: row.age,
+    implied_value_low_usd: row.low,
+    implied_value_high_usd: row.high,
     implied_value_usd: row.value,
     token_status: "pre-token",
     value_drivers: row.factors,
@@ -297,6 +467,8 @@ export function buildRadar(snapshot: Snapshot): { board: BoardRow[]; radar: Rada
     board_size: board.length,
     early_size: board.filter((row) => !snapshot.watchlist.includes(row.slug)).length,
     live_size: live.length,
+    universe_size: snapshot.protocols.length,
+    calibration: benchmarks.calibration,
     rows: board.map(({ farm_steps: _steps, ...row }) => row),
     live,
   };
